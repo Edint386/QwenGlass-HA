@@ -165,10 +165,14 @@ class ToolRegistry:
         )
         return (
             "Control exactly one allowlisted Home Assistant entity using one allowlisted service. "
-            f"Allowed services: {services}. {alias_rule}"
-            "For Chinese commands, 打开/关闭 maps to turn_on/turn_off; 调到 N 度 maps to "
-            "climate.set_temperature with temperature=N; 亮度 N% maps to light.turn_on with "
-            "brightness_pct=N. If a device reference such as `灯` matches more than one entity, "
+            "Pass the domain separately and pass only the unqualified service name in `service` "
+            "(for example, domain=climate with service=set_temperature; never put "
+            "`climate.set_temperature` in `service`). "
+            f"Allowed domain.service pairs: {services}. {alias_rule}"
+            "For Chinese commands, 打开/关闭 maps to service=turn_on/turn_off; 调到 N 度 maps "
+            "to domain=climate, service=set_temperature with temperature=N; 亮度 N% maps to "
+            "domain=light, service=turn_on with brightness_pct=N. If a device reference such "
+            "as `灯` matches more than one entity, "
             "call list_ha_states and ask which one instead of guessing. Always pass "
             "service_data.entity_id. Use dry_run=true only for validation."
         )
@@ -182,11 +186,15 @@ class ToolRegistry:
         }
 
     def _service_schema(self) -> dict[str, Any]:
+        services = sorted(
+            {service.split(".", 1)[1] for service in self.settings.allowed_ha_services}
+        )
         return {
             "type": "string",
-            "pattern": "^[a-z0-9_]+$",
+            "enum": services,
             "description": (
-                "Service name. Valid domain.service pairs: "
+                "Unqualified service name only. Do not include the domain or a dot. "
+                "Valid domain.service pairs: "
                 + ", ".join(sorted(self.settings.allowed_ha_services))
             ),
         }

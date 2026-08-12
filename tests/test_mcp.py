@@ -239,7 +239,12 @@ def test_write_tool_catalog_exposes_aliases_and_exact_entities(make_settings, fa
     tool = next(item for item in catalog if item["name"] == "call_ha_service")
     assert "Configured aliases are listed once" in tool["description"]
     assert "ask which one instead of guessing" in tool["description"]
+    assert "only the unqualified service name" in tool["description"]
+    assert "never put `climate.set_temperature` in `service`" in tool["description"]
     assert tool["inputSchema"]["properties"]["domain"]["enum"] == ["light"]
+    service_schema = tool["inputSchema"]["properties"]["service"]
+    assert service_schema["enum"] == ["turn_off", "turn_on"]
+    assert "Do not include the domain or a dot" in service_schema["description"]
     service_data = tool["inputSchema"]["properties"]["service_data"]
     assert service_data["properties"]["entity_id"]["enum"] == ["light.living_room"]
     assert "客厅灯 -> light.living_room" in service_data["properties"]["entity_id"]["description"]
