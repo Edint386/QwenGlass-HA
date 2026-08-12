@@ -1,0 +1,46 @@
+[Unit]
+Description=Qwen/Quark Glasses to Home Assistant MCP Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qwen-bridge
+Group=qwen-bridge
+WorkingDirectory=/opt/qwen-bridge
+EnvironmentFile=/etc/qwen-ha-bridge.env
+ExecStart=/opt/qwen-bridge/.venv/bin/qwen-ha-bridge
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+
+# Use journald rotation instead of application-owned log files.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qwen-ha-bridge
+
+# systemd hardening. The bridge only needs network access and read-only code/secrets.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

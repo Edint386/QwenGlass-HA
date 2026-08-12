@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qwen-glass-ha"
+version = "0.1.0"
+description = "A defensive MCP bridge between Qwen/Quark glasses and Home Assistant"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+  "httpx==0.28.1",
+  "starlette==1.6.0",
+  "uvicorn==0.52.1",
+]
+
+[project.scripts]
+qwen-ha-bridge = "qwen_ha_bridge.__main__:main"
+
+[dependency-groups]
+dev = [
+  "httpx2==2.10.0",
+  "pytest>=8.3,<10",
+  "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["qwen_ha_bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
