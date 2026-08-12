@@ -1,9 +1,23 @@
+{
+    # Disable HTTP/3 (QUIC). The Qwen execution client (okhttp/4.12.0) honors the
+    # `Alt-Svc: h3=":443"` advertisement and upgrades subsequent requests to QUIC
+    # on UDP/443. That UDP path is unreachable from Qwen's network, so the QUIC
+    # handshake hangs until the client timeout and the request never reaches this
+    # server (no access-log entry). Staying on HTTP/1.1 + HTTP/2 is required for
+    # the MCP Streamable HTTP transport to work end to end.
+    servers {
+        protocols h1 h2
+    }
+}
+
 ha.qwen.xsnight.cn {
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Content-Type-Options "nosniff"
         Referrer-Policy "no-referrer"
         -Server
+        # Belt-and-suspenders: never advertise HTTP/3 even if re-enabled above.
+        -Alt-Svc
     }
 
     log {

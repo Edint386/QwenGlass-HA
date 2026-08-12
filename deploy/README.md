@@ -46,9 +46,10 @@ sudo systemctl status qwen-bridge
 sudo journalctl -u qwen-bridge -n 100 --no-pager
 ```
 
-Install/reload the Caddyfile and confirm `https://ha.qwen.xsnight.cn/healthz`.
-Configure the Qwen MCP server with an `Authorization: Bearer <bridge key>`
-header, refresh tools, and verify `bridge_status`.
+Install/reload the Caddyfile, run the HTTP/3 regression guard below, and confirm
+`https://ha.qwen.xsnight.cn/healthz`. Configure the Qwen MCP server with an
+`Authorization: Bearer <bridge key>` header, refresh tools, and verify
+`bridge_status`.
 
 ## 4. Enable controlled writes
 
@@ -61,6 +62,31 @@ Only after authenticated reads pass, set `ENABLE_WRITE_TOOLS=true` and a small
 The Python process must listen on `127.0.0.1:8000`. Remove any firewall rule
 that exposes TCP/8000 publicly. Public ingress should be limited to SSH, HTTPS,
 and HTTP if Caddy needs HTTP-01 certificate renewal.
+
+## HTTP/3 regression guard
+
+The Qwen execution client (okhttp/4.12.0) honors the `Alt-Svc: h3=":443"`
+advertisement and upgrades subsequent MCP requests to HTTP/3 (QUIC) on UDP/443.
+From Qwen's network that UDP path is unreachable, so the QUIC handshake hangs
+until the client timeout and the request never reaches this server — surfacing
+as "MCP 工具执行超时" with no Caddy access-log entry. The Caddyfile therefore
+disables HTTP/3 (`servers { protocols h1 h2 }`) and strips `Alt-Svc`.
+
+Run the guard after every Caddy change or redeploy to catch a regression:
+
+```bash
+# Static check of the file in the repo (no network needed):
+bash scripts/verify_caddy.sh deploy/Caddyfile
+
+# Live check against the public endpoint + local UDP/443 listener
+# (run this ON the deployment host so the ss check sees the real listener):
+bash scripts/verify_caddy.sh deploy/Caddyfile https://ha.qwen.xsnight.cn/mcp
+```
+
+The guard exits non-zero if HTTP/3 could be re-enabled (missing `protocols h1
+h2`, missing `-Alt-Svc`, a live `Alt-Svc` header, or a UDP/443 listener). Wire it
+into any deploy automation so a future `caddy adapt`/reload cannot silently turn
+QUIC back on. `ENABLE_WRITE_TOOLS` and all credentials are untouched by this step.
 
 ## Rollback
 
