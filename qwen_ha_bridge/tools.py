@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -57,7 +58,8 @@ class ToolRegistry:
                 name="list_ha_states",
                 description=(
                     "List Home Assistant entity IDs, current states, and friendly names. "
-                    "Results can be filtered and paginated."
+                    "Results can be filtered and paginated. Before controlling a device, "
+                    "use this tool when its name or room does not resolve to one configured alias."
                 ),
                 input_schema={
                     "type": "object",
@@ -110,24 +112,28 @@ class ToolRegistry:
             definitions.append(
                 ToolDefinition(
                     name="call_ha_service",
-                    description=(
-                        "Call one explicitly allowlisted Home Assistant service. "
-                        "Use dry_run=true to validate without operating a device."
-                    ),
+                    description=self._write_tool_description(),
                     input_schema={
                         "type": "object",
                         "properties": {
-                            "domain": {"type": "string", "pattern": "^[a-z0-9_]+$"},
-                            "service": {"type": "string", "pattern": "^[a-z0-9_]+$"},
-                            "service_data": {
-                                "type": "object",
-                                "description": "Home Assistant service data object.",
-                            },
+                            "domain": self._domain_schema(),
+                            "service": self._service_schema(),
+                            "service_data": self._service_data_schema(),
                             "service_data_json": {
                                 "type": "string",
-                                "description": "Legacy JSON-string form of service_data.",
+                                "description": (
+                                    "Legacy JSON-string form of service_data. It must contain the "
+                                    "same exact allowlisted entity_id and obey the same limits."
+                                ),
                             },
-                            "dry_run": {"type": "boolean", "default": False},
+                            "dry_run": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "Use true only to validate a planned call without operating a "
+                                    "device. Use false for an explicit user control request."
+                                ),
+                            },
                         },
                         "required": ["domain", "service"],
                         "additionalProperties": False,
@@ -141,6 +147,80 @@ class ToolRegistry:
                 )
             )
         return [definition.as_mcp() for definition in definitions]
+
+    def _alias_summary(self) -> str:
+        grouped: dict[str, list[str]] = {}
+        for alias, entity_id in self.settings.ha_device_aliases:
+            grouped.setdefault(entity_id, []).append(alias)
+        return "; ".join(
+            f"{'/'.join(aliases)} -> {entity_id}" for entity_id, aliases in grouped.items()
+        )
+
+    def _write_tool_description(self) -> str:
+        services = ", ".join(sorted(self.settings.allowed_ha_services))
+        alias_rule = (
+            "Configured aliases are listed once in service_data.entity_id. "
+            if self.settings.ha_device_aliases
+            else "No aliases are configured; resolve the exact entity with list_ha_states. "
+        )
+        return (
+            "Control exactly one allowlisted Home Assistant entity using one allowlisted service. "
+            f"Allowed services: {services}. {alias_rule}"
+            "For Chinese commands, 打开/关闭 maps to turn_on/turn_off; 调到 N 度 maps to "
+            "climate.set_temperature with temperature=N; 亮度 N% maps to light.turn_on with "
+            "brightness_pct=N. If a device reference such as `灯` matches more than one entity, "
+            "call list_ha_states and ask which one instead of guessing. Always pass "
+            "service_data.entity_id. Use dry_run=true only for validation."
+        )
+
+    def _domain_schema(self) -> dict[str, Any]:
+        domains = sorted(service.split(".", 1)[0] for service in self.settings.allowed_ha_services)
+        return {
+            "type": "string",
+            "enum": sorted(set(domains)),
+            "description": "Home Assistant service domain allowed by this private bridge.",
+        }
+
+    def _service_schema(self) -> dict[str, Any]:
+        return {
+            "type": "string",
+            "pattern": "^[a-z0-9_]+$",
+            "description": (
+                "Service name. Valid domain.service pairs: "
+                + ", ".join(sorted(self.settings.allowed_ha_services))
+            ),
+        }
+
+    def _service_data_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "description": (
+                "Parameters for one device. entity_id is mandatory and must be one of the "
+                "configured entities. Alternate HA targets such as area_id or device_id are "
+                "rejected."
+            ),
+            "properties": {
+                "entity_id": {
+                    "type": "string",
+                    "enum": sorted(self.settings.allowed_ha_entities),
+                    "description": self._alias_summary() or "An exact allowlisted entity ID.",
+                },
+                "temperature": {
+                    "type": "number",
+                    "minimum": self.settings.climate_temperature_min,
+                    "maximum": self.settings.climate_temperature_max,
+                    "description": "Target temperature in degrees Celsius.",
+                },
+                "brightness_pct": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Optional light brightness percentage.",
+                },
+            },
+            "required": ["entity_id"],
+            "additionalProperties": True,
+        }
 
     async def execute(self, name: str, arguments: Any) -> dict[str, Any]:
         if not isinstance(name, str) or not name:
@@ -238,6 +318,80 @@ class ToolRegistry:
             or f"{domain}.*" in self.settings.allowed_ha_services
         )
 
+    @staticmethod
+    def _only_service_data_keys(payload: dict[str, Any], allowed: set[str]) -> None:
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise ToolInputError(
+                f"unexpected service_data keys: {', '.join(unknown)}",
+                code="invalid_arguments",
+            )
+
+    def _validate_service_payload(self, domain: str, service: str, payload: dict[str, Any]) -> str:
+        alternate_targets = sorted({"area_id", "device_id", "label_id"} & set(payload))
+        if alternate_targets:
+            raise ToolInputError(
+                "alternate Home Assistant targets are not allowed: " + ", ".join(alternate_targets),
+                code="invalid_arguments",
+            )
+        entity_id = payload.get("entity_id")
+        if not isinstance(entity_id, str) or not _ENTITY_ID.fullmatch(entity_id):
+            raise ToolInputError(
+                "service_data.entity_id must be one exact entity ID",
+                code="invalid_arguments",
+            )
+        if entity_id not in self.settings.allowed_ha_entities:
+            raise ToolPermissionError(
+                f"entity {entity_id} is not allowlisted", code="entity_not_allowed"
+            )
+        entity_domain = entity_id.split(".", 1)[0]
+        if entity_domain != domain:
+            raise ToolInputError(
+                f"service domain {domain} does not match entity domain {entity_domain}",
+                code="invalid_arguments",
+            )
+
+        service_name = f"{domain}.{service}"
+        if service_name in {"climate.turn_on", "climate.turn_off", "light.turn_off"}:
+            self._only_service_data_keys(payload, {"entity_id"})
+        elif service_name == "climate.set_temperature":
+            self._only_service_data_keys(payload, {"entity_id", "temperature"})
+            temperature = payload.get("temperature")
+            if (
+                isinstance(temperature, bool)
+                or not isinstance(temperature, (int, float))
+                or not math.isfinite(temperature)
+            ):
+                raise ToolInputError(
+                    "service_data.temperature must be a finite number",
+                    code="invalid_arguments",
+                )
+            if not (
+                self.settings.climate_temperature_min
+                <= temperature
+                <= self.settings.climate_temperature_max
+            ):
+                raise ToolInputError(
+                    "service_data.temperature must be between "
+                    f"{self.settings.climate_temperature_min:g} and "
+                    f"{self.settings.climate_temperature_max:g}",
+                    code="invalid_arguments",
+                )
+        elif service_name == "light.turn_on":
+            self._only_service_data_keys(payload, {"entity_id", "brightness_pct"})
+            if "brightness_pct" in payload:
+                brightness = payload["brightness_pct"]
+                if (
+                    isinstance(brightness, bool)
+                    or not isinstance(brightness, int)
+                    or not 1 <= brightness <= 100
+                ):
+                    raise ToolInputError(
+                        "service_data.brightness_pct must be an integer between 1 and 100",
+                        code="invalid_arguments",
+                    )
+        return entity_id
+
     async def _call_service(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if not self.settings.enable_write_tools:
             raise ToolPermissionError("write tools are disabled", code="writes_disabled")
@@ -274,6 +428,7 @@ class ToolRegistry:
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
         if len(encoded) > self.settings.max_service_data_bytes:
             raise ToolInputError("service_data is too large", code="invalid_arguments")
+        entity_id = self._validate_service_payload(domain, service, payload)
         dry_run = arguments.get("dry_run", False)
         if not isinstance(dry_run, bool):
             raise ToolInputError("dry_run must be a boolean", code="invalid_arguments")
@@ -282,6 +437,7 @@ class ToolRegistry:
                 "dry_run": True,
                 "allowed": True,
                 "service": f"{domain}.{service}",
+                "entity_id": entity_id,
                 "service_data_keys": sorted(payload),
             }
         return await self.ha.call_service(domain, service, payload)

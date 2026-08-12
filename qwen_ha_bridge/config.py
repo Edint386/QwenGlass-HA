@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .errors import ConfigurationError
+
+_ENTITY_ID = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+_MAX_DEVICE_ALIASES = 64
+_MAX_DEVICE_ALIAS_DESCRIPTION_CHARS = 1_800
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -52,6 +58,55 @@ def _csv(raw: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(part.strip() for part in raw.split(",") if part.strip()))
 
 
+def _device_aliases(raw: str) -> tuple[tuple[str, str], ...]:
+    value = raw.strip()
+    if not value:
+        return ()
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ConfigurationError(
+            "HA_DEVICE_ALIASES_JSON must be valid JSON", code="invalid_config"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ConfigurationError(
+            "HA_DEVICE_ALIASES_JSON must be a JSON object", code="invalid_config"
+        )
+    if len(payload) > _MAX_DEVICE_ALIASES:
+        raise ConfigurationError(
+            f"HA_DEVICE_ALIASES_JSON supports at most {_MAX_DEVICE_ALIASES} aliases",
+            code="invalid_config",
+        )
+
+    aliases: list[tuple[str, str]] = []
+    description_chars = 0
+    for raw_alias, raw_entity_id in payload.items():
+        if not isinstance(raw_alias, str) or not isinstance(raw_entity_id, str):
+            raise ConfigurationError(
+                "HA_DEVICE_ALIASES_JSON keys and values must be strings",
+                code="invalid_config",
+            )
+        alias = raw_alias.strip()
+        entity_id = raw_entity_id.strip()
+        if not alias or len(alias) > 64 or any(ord(character) < 32 for character in alias):
+            raise ConfigurationError(
+                f"invalid HA device alias: {raw_alias!r}", code="invalid_config"
+            )
+        if not _ENTITY_ID.fullmatch(entity_id):
+            raise ConfigurationError(
+                f"invalid HA device alias entity: {raw_entity_id!r}", code="invalid_config"
+            )
+        description_chars += len(alias) + len(entity_id) + 4
+        aliases.append((alias, entity_id))
+
+    if description_chars > _MAX_DEVICE_ALIAS_DESCRIPTION_CHARS:
+        raise ConfigurationError(
+            "HA_DEVICE_ALIASES_JSON is too large for a concise MCP tool description",
+            code="invalid_config",
+        )
+    return tuple(aliases)
+
+
 def _validated_base_url(raw: str) -> str:
     value = raw.strip().rstrip("/")
     parsed = urlsplit(value)
@@ -80,6 +135,10 @@ class Settings:
     auth_mode: str = "required"
     enable_write_tools: bool = False
     allowed_ha_services: frozenset[str] = frozenset()
+    allowed_ha_entities: frozenset[str] = frozenset()
+    ha_device_aliases: tuple[tuple[str, str], ...] = ()
+    climate_temperature_min: float = 16.0
+    climate_temperature_max: float = 30.0
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
     allowed_hosts: tuple[str, ...] = ("localhost", "127.0.0.1")
@@ -110,12 +169,35 @@ class Settings:
                 "write tools require a non-empty ALLOWED_HA_SERVICES allowlist",
                 code="unsafe_config",
             )
+        if self.enable_write_tools and not self.allowed_ha_entities:
+            raise ConfigurationError(
+                "write tools require a non-empty ALLOWED_HA_ENTITIES allowlist",
+                code="unsafe_config",
+            )
         for item in self.allowed_ha_services:
             parts = item.split(".")
             if len(parts) != 2 or not all(parts) or (parts[1] == "*" and not parts[0]):
                 raise ConfigurationError(
                     f"invalid ALLOWED_HA_SERVICES entry: {item}", code="invalid_config"
                 )
+        for entity_id in self.allowed_ha_entities:
+            if not _ENTITY_ID.fullmatch(entity_id):
+                raise ConfigurationError(
+                    f"invalid ALLOWED_HA_ENTITIES entry: {entity_id}", code="invalid_config"
+                )
+        alias_targets = {entity_id for _, entity_id in self.ha_device_aliases}
+        unlisted_alias_targets = sorted(alias_targets - self.allowed_ha_entities)
+        if unlisted_alias_targets:
+            raise ConfigurationError(
+                "HA_DEVICE_ALIASES_JSON targets must be present in ALLOWED_HA_ENTITIES: "
+                + ", ".join(unlisted_alias_targets),
+                code="unsafe_config",
+            )
+        if self.climate_temperature_min >= self.climate_temperature_max:
+            raise ConfigurationError(
+                "CLIMATE_TEMPERATURE_MIN must be below CLIMATE_TEMPERATURE_MAX",
+                code="invalid_config",
+            )
         if not self.allowed_hosts:
             raise ConfigurationError("ALLOWED_HOSTS cannot be empty", code="invalid_config")
         if not self.bind_host:
@@ -125,6 +207,8 @@ class Settings:
     def from_env(cls) -> Settings:
         auth_mode = os.getenv("BRIDGE_AUTH_MODE", "required").strip().lower()
         services = frozenset(_csv(os.getenv("ALLOWED_HA_SERVICES", "")))
+        entities = frozenset(_csv(os.getenv("ALLOWED_HA_ENTITIES", "")))
+        aliases = _device_aliases(os.getenv("HA_DEVICE_ALIASES_JSON", ""))
         hosts = _csv(os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1"))
         log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
@@ -138,6 +222,14 @@ class Settings:
             auth_mode=auth_mode,
             enable_write_tools=_bool("ENABLE_WRITE_TOOLS", False),
             allowed_ha_services=services,
+            allowed_ha_entities=entities,
+            ha_device_aliases=aliases,
+            climate_temperature_min=_float(
+                "CLIMATE_TEMPERATURE_MIN", 16.0, minimum=-50.0, maximum=100.0
+            ),
+            climate_temperature_max=_float(
+                "CLIMATE_TEMPERATURE_MAX", 30.0, minimum=-50.0, maximum=100.0
+            ),
             bind_host=os.getenv("BIND_HOST", "127.0.0.1").strip(),
             bind_port=_int("BIND_PORT", 8000, minimum=1, maximum=65_535),
             allowed_hosts=hosts,

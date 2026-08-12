@@ -8,6 +8,8 @@ from starlette.testclient import TestClient
 
 from qwen_ha_bridge.app import create_app
 
+LIGHT_ENTITIES = frozenset({"light.living_room"})
+
 
 def auth_headers() -> dict[str, str]:
     return {"Authorization": "Bearer bridge-secret", "Content-Type": "application/json"}
@@ -190,6 +192,7 @@ def test_write_tool_allowlist_and_dry_run(make_settings, fake_ha) -> None:
     settings = make_settings(
         enable_write_tools=True,
         allowed_ha_services=frozenset({"light.turn_on"}),
+        allowed_ha_entities=LIGHT_ENTITIES,
     )
     app = create_app(settings, ha_transport=httpx.MockTransport(fake_ha))
     with TestClient(app) as client:
@@ -216,7 +219,30 @@ def test_write_tool_allowlist_and_dry_run(make_settings, fake_ha) -> None:
         ).json()["result"]
     assert dry_run["isError"] is False
     assert dry_run["structuredContent"]["dry_run"] is True
+    assert dry_run["structuredContent"]["entity_id"] == "light.living_room"
     assert fake_ha.service_calls == 0
+
+
+def test_write_tool_catalog_exposes_aliases_and_exact_entities(make_settings, fake_ha) -> None:
+    settings = make_settings(
+        enable_write_tools=True,
+        allowed_ha_services=frozenset({"light.turn_on", "light.turn_off"}),
+        allowed_ha_entities=LIGHT_ENTITIES,
+        ha_device_aliases=(("客厅灯", "light.living_room"),),
+    )
+    app = create_app(settings, ha_transport=httpx.MockTransport(fake_ha))
+    with TestClient(app) as client:
+        catalog = client.post(
+            "/mcp", headers=auth_headers(), json=rpc("tools/list", msg_id=2, params={})
+        ).json()["result"]["tools"]
+
+    tool = next(item for item in catalog if item["name"] == "call_ha_service")
+    assert "Configured aliases are listed once" in tool["description"]
+    assert "ask which one instead of guessing" in tool["description"]
+    assert tool["inputSchema"]["properties"]["domain"]["enum"] == ["light"]
+    service_data = tool["inputSchema"]["properties"]["service_data"]
+    assert service_data["properties"]["entity_id"]["enum"] == ["light.living_room"]
+    assert "客厅灯 -> light.living_room" in service_data["properties"]["entity_id"]["description"]
 
 
 def test_write_tool_executes_one_allowlisted_call(make_settings, fake_ha) -> None:
@@ -224,6 +250,7 @@ def test_write_tool_executes_one_allowlisted_call(make_settings, fake_ha) -> Non
         make_settings(
             enable_write_tools=True,
             allowed_ha_services=frozenset({"light.turn_on"}),
+            allowed_ha_entities=LIGHT_ENTITIES,
         ),
         ha_transport=httpx.MockTransport(fake_ha),
     )
@@ -253,6 +280,7 @@ def test_unlisted_service_is_blocked(make_settings, fake_ha) -> None:
         make_settings(
             enable_write_tools=True,
             allowed_ha_services=frozenset({"light.turn_on"}),
+            allowed_ha_entities=LIGHT_ENTITIES,
         ),
         ha_transport=httpx.MockTransport(fake_ha),
     )
@@ -272,6 +300,200 @@ def test_unlisted_service_is_blocked(make_settings, fake_ha) -> None:
     result = response.json()["result"]
     assert result["isError"] is True
     assert result["structuredContent"]["code"] == "service_not_allowed"
+    assert fake_ha.service_calls == 0
+
+
+def test_write_tool_requires_exact_entity(make_settings, fake_ha) -> None:
+    app = create_app(
+        make_settings(
+            enable_write_tools=True,
+            allowed_ha_services=frozenset({"light.turn_on"}),
+            allowed_ha_entities=LIGHT_ENTITIES,
+        ),
+        ha_transport=httpx.MockTransport(fake_ha),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=3,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "light",
+                        "service": "turn_on",
+                        "service_data": {},
+                        "dry_run": True,
+                    },
+                },
+            ),
+        )
+    result = response.json()["result"]
+    assert result["isError"] is True
+    assert result["structuredContent"]["code"] == "invalid_arguments"
+    assert fake_ha.service_calls == 0
+
+
+def test_write_tool_blocks_unlisted_entity(make_settings, fake_ha) -> None:
+    app = create_app(
+        make_settings(
+            enable_write_tools=True,
+            allowed_ha_services=frozenset({"light.turn_on"}),
+            allowed_ha_entities=LIGHT_ENTITIES,
+        ),
+        ha_transport=httpx.MockTransport(fake_ha),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=3,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "light",
+                        "service": "turn_on",
+                        "service_data": {"entity_id": "light.bedroom"},
+                        "dry_run": True,
+                    },
+                },
+            ),
+        )
+    result = response.json()["result"]
+    assert result["isError"] is True
+    assert result["structuredContent"]["code"] == "entity_not_allowed"
+    assert fake_ha.service_calls == 0
+
+
+def test_write_tool_blocks_alternate_target_and_domain_mismatch(make_settings, fake_ha) -> None:
+    settings = make_settings(
+        enable_write_tools=True,
+        allowed_ha_services=frozenset({"light.turn_on", "climate.turn_on"}),
+        allowed_ha_entities=frozenset({"light.living_room", "climate.living_room"}),
+    )
+    app = create_app(settings, ha_transport=httpx.MockTransport(fake_ha))
+    with TestClient(app) as client:
+        area_response = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=3,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "light",
+                        "service": "turn_on",
+                        "service_data": {
+                            "entity_id": "light.living_room",
+                            "area_id": "living_room",
+                        },
+                        "dry_run": True,
+                    },
+                },
+            ),
+        ).json()["result"]
+        mismatch_response = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=4,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "light",
+                        "service": "turn_on",
+                        "service_data": {"entity_id": "climate.living_room"},
+                        "dry_run": True,
+                    },
+                },
+            ),
+        ).json()["result"]
+
+    assert area_response["structuredContent"]["code"] == "invalid_arguments"
+    assert mismatch_response["structuredContent"]["code"] == "invalid_arguments"
+    assert fake_ha.service_calls == 0
+
+
+def test_climate_temperature_and_light_brightness_are_bounded(make_settings, fake_ha) -> None:
+    settings = make_settings(
+        enable_write_tools=True,
+        allowed_ha_services=frozenset({"climate.set_temperature", "light.turn_on"}),
+        allowed_ha_entities=frozenset({"climate.living_room", "light.living_room"}),
+        climate_temperature_min=16,
+        climate_temperature_max=30,
+    )
+    app = create_app(settings, ha_transport=httpx.MockTransport(fake_ha))
+    with TestClient(app) as client:
+        too_hot = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=3,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "climate",
+                        "service": "set_temperature",
+                        "service_data": {
+                            "entity_id": "climate.living_room",
+                            "temperature": 31,
+                        },
+                        "dry_run": True,
+                    },
+                },
+            ),
+        ).json()["result"]
+        invalid_brightness = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=4,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "light",
+                        "service": "turn_on",
+                        "service_data": {
+                            "entity_id": "light.living_room",
+                            "brightness_pct": 101,
+                        },
+                        "dry_run": True,
+                    },
+                },
+            ),
+        ).json()["result"]
+        valid_temperature = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=5,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "climate",
+                        "service": "set_temperature",
+                        "service_data": {
+                            "entity_id": "climate.living_room",
+                            "temperature": 24,
+                        },
+                        "dry_run": True,
+                    },
+                },
+            ),
+        ).json()["result"]
+
+    assert too_hot["structuredContent"]["code"] == "invalid_arguments"
+    assert invalid_brightness["structuredContent"]["code"] == "invalid_arguments"
+    assert valid_temperature["isError"] is False
     assert fake_ha.service_calls == 0
 
 

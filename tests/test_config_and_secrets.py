@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ def test_write_tools_require_authentication(settings: Settings) -> None:
             auth_mode="disabled",
             enable_write_tools=True,
             allowed_ha_services=frozenset({"light.turn_on"}),
+            allowed_ha_entities=frozenset({"light.living_room"}),
         )
 
 
@@ -28,6 +30,58 @@ def test_write_tools_require_allowlist(settings: Settings) -> None:
             auth_mode="required",
             enable_write_tools=True,
         )
+
+
+def test_write_tools_require_entity_allowlist(settings: Settings) -> None:
+    with pytest.raises(ConfigurationError, match="non-empty ALLOWED_HA_ENTITIES"):
+        Settings(
+            ha_token_file=settings.ha_token_file,
+            bridge_api_key_file=settings.bridge_api_key_file,
+            auth_mode="required",
+            enable_write_tools=True,
+            allowed_ha_services=frozenset({"light.turn_on"}),
+        )
+
+
+def test_alias_targets_must_be_allowlisted(settings: Settings) -> None:
+    with pytest.raises(ConfigurationError, match="targets must be present"):
+        Settings(
+            ha_token_file=settings.ha_token_file,
+            bridge_api_key_file=settings.bridge_api_key_file,
+            allowed_ha_entities=frozenset({"light.living_room"}),
+            ha_device_aliases=(("卧室灯", "light.bedroom"),),
+        )
+
+
+def test_device_aliases_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALLOWED_HA_ENTITIES", "climate.living_room,light.desk")
+    monkeypatch.setenv(
+        "HA_DEVICE_ALIASES_JSON",
+        '{"空调":"climate.living_room","挂灯":"light.desk"}',
+    )
+
+    loaded = Settings.from_env()
+
+    assert loaded.allowed_ha_entities == frozenset({"climate.living_room", "light.desk"})
+    assert loaded.ha_device_aliases == (
+        ("空调", "climate.living_room"),
+        ("挂灯", "light.desk"),
+    )
+
+
+def test_invalid_device_alias_json_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HA_DEVICE_ALIASES_JSON", "not-json")
+
+    with pytest.raises(ConfigurationError, match="must be valid JSON"):
+        Settings.from_env()
+
+
+def test_device_alias_count_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    aliases = {f"灯{i}": "light.desk" for i in range(65)}
+    monkeypatch.setenv("HA_DEVICE_ALIASES_JSON", json.dumps(aliases))
+
+    with pytest.raises(ConfigurationError, match="at most 64 aliases"):
+        Settings.from_env()
 
 
 def test_secret_file_rejects_group_readable(tmp_path: Path) -> None:

@@ -53,9 +53,25 @@ Install/reload the Caddyfile, run the HTTP/3 regression guard below, and confirm
 
 ## 4. Enable controlled writes
 
-Only after authenticated reads pass, set `ENABLE_WRITE_TOOLS=true` and a small
-`ALLOWED_HA_SERVICES` list. Restart, refresh the tool catalog, invoke
-`call_ha_service` with `dry_run=true`, then test one reversible device action.
+Only after authenticated reads pass, configure both a small service allowlist
+and an exact entity allowlist. Aliases are optional, but let the existing MCP
+tool catalog carry common spoken names without adding another tool:
+
+```dotenv
+ENABLE_WRITE_TOOLS=true
+ALLOWED_HA_SERVICES=climate.turn_on,climate.turn_off,climate.set_temperature,light.turn_on,light.turn_off
+ALLOWED_HA_ENTITIES=climate.living_room,light.desk
+HA_DEVICE_ALIASES_JSON='{"空调":"climate.living_room","客厅空调":"climate.living_room","挂灯":"light.desk"}'
+CLIMATE_TEMPERATURE_MIN=16
+CLIMATE_TEMPERATURE_MAX=30
+```
+
+Use deployment-specific entity IDs in `/etc/qwen-ha-bridge.env`; do not commit
+them or credentials to the repository. Restart the bridge, refresh the Qwen
+tool catalog, and confirm `call_ha_service` exposes the intended services,
+entities, and aliases. Run `dry_run=true` for each permitted action class.
+Leave real device actuation to the owner during the physical-device test, and
+keep the MCP/Skill drafts unpublished until that test passes.
 
 ## 5. Network cutover
 

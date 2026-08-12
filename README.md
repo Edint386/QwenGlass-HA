@@ -10,7 +10,8 @@
   关闭防火墙上的公网 `tcp/8000`。
 - MCP 默认要求独立的桥接 Bearer Token。它和 HA 长期令牌分开保存，并且都只能从
   权限为 `0600` 的文件读取，永远不写入 Git、参数或日志。
-- 写工具默认关闭。开启时必须同时启用认证，并配置精确的 HA 服务 allowlist。
+- 写工具默认关闭。开启时必须同时启用认证，并配置精确的 HA 服务与实体双重
+  allowlist；允许某个服务并不代表它可以操作其他实体。
 - HA `GET` 在传输错误时最多安全重试一次；可能操作设备的 `POST` 永不自动重试，
   避免一次指令执行两遍。
 - 请求体、HA 响应、服务参数、并发量和旧协议 session 都有上限。
@@ -24,8 +25,18 @@
 - `list_ha_states`：分页列出实体，可按 domain 过滤；
 - `get_ha_state`：读取一个合法 `entity_id` 的完整状态。
 
-只有 `ENABLE_WRITE_TOOLS=true` 且服务位于 `ALLOWED_HA_SERVICES` 时，才会额外暴露
+只有 `ENABLE_WRITE_TOOLS=true`，且服务和目标实体分别位于
+`ALLOWED_HA_SERVICES` / `ALLOWED_HA_ENTITIES` 时，才会额外暴露
 `call_ha_service`。该工具支持 `dry_run=true`，实际调用不会自动重试。
+
+快捷设备别名通过 `HA_DEVICE_ALIASES_JSON` 配置，并随现有
+`call_ha_service` 的工具说明和 `entity_id` 枚举一起返回给 MCP 客户端，不需要新增接口。
+因此“打开空调”“挂灯调到 50%”这类稳定映射可以由 MCP 自带；只有需要更长的对话规则、
+场景编排或示例时才需要额外 Skill。别名数量和说明总长度都有上限，避免设备变多后
+工具描述无限膨胀；没有唯一命中时，模型应先查询并向用户澄清。
+
+内置快捷动作还会校验参数：空调设温限制在配置的上下限内，灯光亮度必须为
+1–100 的整数，且拒绝 `area_id`、`device_id` 等可能扩大作用范围的替代目标。
 
 ## 千问兼容性
 
@@ -77,7 +88,7 @@ uv run python scripts/verify_mcp.py http://127.0.0.1:8000/mcp
 1. 生成独立 `bridge_api_key`，不要复用 HA token；
 2. 在千问自定义 MCP 配置中加入 `Authorization: Bearer ...`；
 3. 先保持写工具关闭，完成 `initialize / tools/list / bridge_status` 验收；
-4. 再按需开启少量服务 allowlist，先用 `dry_run=true` 验证；
+4. 再按需开启少量服务与实体双重 allowlist，先用 `dry_run=true` 验证；
 5. 关闭公网 `8000`，只保留 Caddy 的 443（以及证书续期所需的 80）。
 
 阿里云官方文档确认远程 MCP 可配置 `Authorization` header，且 HTTP 401/403 是受支持
