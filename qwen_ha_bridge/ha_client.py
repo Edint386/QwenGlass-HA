@@ -96,19 +96,25 @@ class HomeAssistantClient:
         *,
         payload: Mapping[str, Any] | None = None,
         require_token: bool = True,
+        timeout_seconds: float | None = None,
+        retry_transport: bool | None = None,
     ) -> httpx.Response:
-        safe_to_retry = method == "GET"
+        safe_to_retry = method == "GET" and retry_transport is not False
         attempts = 2 if safe_to_retry else 1
         last_error: httpx.TransportError | None = None
         for attempt in range(attempts):
             try:
                 client = await self._ensure_client()
                 async with self._semaphore:
+                    request_options: dict[str, Any] = {}
+                    if timeout_seconds is not None:
+                        request_options["timeout"] = httpx.Timeout(timeout_seconds)
                     response = await client.request(
                         method,
                         path,
                         headers=self._headers(require_token=require_token),
                         json=dict(payload) if payload is not None else None,
+                        **request_options,
                     )
                 if len(response.content) > self.settings.max_ha_response_bytes:
                     raise HomeAssistantError(
@@ -180,8 +186,19 @@ class HomeAssistantClient:
             )
         return [item for item in data if isinstance(item, dict)]
 
-    async def state(self, entity_id: str) -> dict[str, Any]:
-        response = await self._request("GET", f"/api/states/{entity_id}")
+    async def state(
+        self,
+        entity_id: str,
+        *,
+        timeout_seconds: float | None = None,
+        retry_transport: bool | None = None,
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "GET",
+            f"/api/states/{entity_id}",
+            timeout_seconds=timeout_seconds,
+            retry_transport=retry_transport,
+        )
         self._require_success(response)
         data = self._json(response)
         if not isinstance(data, dict):
@@ -192,9 +209,19 @@ class HomeAssistantClient:
         return data
 
     async def call_service(
-        self, domain: str, service: str, payload: Mapping[str, Any]
+        self,
+        domain: str,
+        service: str,
+        payload: Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        response = await self._request("POST", f"/api/services/{domain}/{service}", payload=payload)
+        response = await self._request(
+            "POST",
+            f"/api/services/{domain}/{service}",
+            payload=payload,
+            timeout_seconds=timeout_seconds,
+        )
         self._require_success(response)
         if not response.content:
             return {"http_status": response.status_code, "body": None}

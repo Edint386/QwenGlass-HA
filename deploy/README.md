@@ -73,6 +73,23 @@ entities, and aliases. Run `dry_run=true` for each permitted action class.
 Leave real device actuation to the owner during the physical-device test, and
 keep the MCP/Skill drafts unpublished until that test passes.
 
+Keep device-control work below Qwen's observed client budget. The defaults use
+a 1.8-second total deadline, a 250ms state-read budget, a single 1-second write
+attempt, and bounded readback polling:
+
+```dotenv
+HA_CONTROL_TOTAL_TIMEOUT_SECONDS=1.8
+HA_CONTROL_READ_TIMEOUT_SECONDS=0.25
+HA_CONTROL_WRITE_TIMEOUT_SECONDS=1.0
+HA_CONTROL_SETTLE_SECONDS=0.05
+```
+
+Do not raise the total above the client budget. The bridge never retries the
+write. It returns success only for an already-satisfied target or a confirmed
+readback; `action_unconfirmed` means the device may have acted but the outcome
+is unknown. Correlate the JSON `request_completed`, `tool_completed`, and
+`control_completed` events by `request_id` when diagnosing a physical test.
+
 ## 5. Network cutover
 
 The Python process must listen on `127.0.0.1:8000`. Remove any firewall rule

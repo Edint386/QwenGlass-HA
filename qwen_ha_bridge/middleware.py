@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 import time
+from contextvars import ContextVar
 from typing import Any
 
 logger = logging.getLogger("qwen_ha_bridge.requests")
+_request_id: ContextVar[str] = ContextVar("qwen_ha_bridge_request_id", default="-")
+
+
+def current_request_id() -> str:
+    """Return the safe correlation ID for the current HTTP request."""
+    return _request_id.get()
 
 
 class RequestMetadataMiddleware:
@@ -23,6 +31,7 @@ class RequestMetadataMiddleware:
         started = time.perf_counter()
         status = 500
         request_id = secrets.token_hex(8)
+        context_token = _request_id.set(request_id)
 
         async def send_wrapped(message: dict[str, Any]) -> None:
             nonlocal status
@@ -37,10 +46,18 @@ class RequestMetadataMiddleware:
             await self.app(scope, receive, send_wrapped)
         finally:
             logger.info(
-                "request id=%s method=%s path=%s status=%s duration_ms=%.1f",
-                request_id,
-                scope.get("method"),
-                scope.get("path"),
-                status,
-                (time.perf_counter() - started) * 1000,
+                "%s",
+                json.dumps(
+                    {
+                        "event": "request_completed",
+                        "request_id": request_id,
+                        "method": scope.get("method"),
+                        "path": scope.get("path"),
+                        "status": status,
+                        "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
             )
+            _request_id.reset(context_token)

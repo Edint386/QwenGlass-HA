@@ -20,6 +20,10 @@ authentication and a non-empty, explicit Home Assistant service allowlist.
 Prefer individual services such as `light.turn_on`; use `domain.*` only after a
 deliberate review.
 
+Control diagnostics may log an allowlisted entity ID, requested service name,
+state labels, HTTP status, timing, and a random request ID. They must never log
+service payload values, request bodies, authorization headers, or credentials.
+
 ## Reporting
 
 Do not open a public issue containing credentials, entity inventories, access

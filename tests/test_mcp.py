@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import logging
 from pathlib import Path
 
 import httpx
@@ -277,7 +280,280 @@ def test_write_tool_executes_one_allowlisted_call(make_settings, fake_ha) -> Non
             ),
         )
     assert response.json()["result"]["isError"] is False
+    result = response.json()["result"]["structuredContent"]
+    assert result["confirmed"] is True
+    assert result["already_satisfied"] is True
+    assert result["write_attempted"] is False
+    assert result["write_outcome"] == "skipped"
+    assert fake_ha.service_calls == 0
+
+
+def test_write_tool_changes_off_light_and_confirms_readback(make_settings, fake_ha) -> None:
+    settings = make_settings(
+        enable_write_tools=True,
+        allowed_ha_services=frozenset({"light.turn_on"}),
+        allowed_ha_entities=LIGHT_ENTITIES,
+    )
+    fake_ha.states[0]["state"] = "off"
+    app = create_app(settings, ha_transport=httpx.MockTransport(fake_ha))
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=3,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "light",
+                        "service": "turn_on",
+                        "service_data": {
+                            "entity_id": "light.living_room",
+                            "brightness_pct": 50,
+                        },
+                    },
+                },
+            ),
+        )
+    result = response.json()["result"]
+    assert result["isError"] is False
+    assert result["structuredContent"]["confirmed"] is True
+    assert result["structuredContent"]["readback_state"] == "on"
     assert fake_ha.service_calls == 1
+
+
+def test_already_on_climate_skips_write(make_settings) -> None:
+    service_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal service_calls
+        if request.url.path == "/api/":
+            return httpx.Response(200, json={"message": "API running."})
+        if request.url.path == "/api/states/climate.living_room":
+            return httpx.Response(
+                200,
+                json={
+                    "entity_id": "climate.living_room",
+                    "state": "heat",
+                    "attributes": {"temperature": 24},
+                },
+            )
+        if request.url.path == "/api/services/climate/turn_on":
+            service_calls += 1
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"message": "not found"})
+
+    app = create_app(
+        make_settings(
+            enable_write_tools=True,
+            allowed_ha_services=frozenset({"climate.turn_on"}),
+            allowed_ha_entities=frozenset({"climate.living_room"}),
+        ),
+        ha_transport=httpx.MockTransport(handler),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=3,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "climate",
+                        "service": "turn_on",
+                        "service_data": {"entity_id": "climate.living_room"},
+                    },
+                },
+            ),
+        )
+    result = response.json()["result"]["structuredContent"]
+    assert result["confirmed"] is True
+    assert result["already_satisfied"] is True
+    assert result["readback_state"] == "heat"
+    assert service_calls == 0
+
+
+def test_write_timeout_can_still_be_confirmed_by_readback(make_settings, fake_ha) -> None:
+    fake_ha.states[0]["state"] = "off"
+    service_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal service_calls
+        if request.url.path == "/api/":
+            return httpx.Response(200, json={"message": "API running."})
+        if request.url.path == "/api/states/light.living_room":
+            return httpx.Response(200, json=fake_ha.states[0])
+        if request.url.path == "/api/services/light/turn_on":
+            service_calls += 1
+            fake_ha.states[0]["state"] = "on"
+            await asyncio.sleep(0.08)
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"message": "not found"})
+
+    settings = make_settings(
+        enable_write_tools=True,
+        allowed_ha_services=frozenset({"light.turn_on"}),
+        allowed_ha_entities=LIGHT_ENTITIES,
+        control_total_timeout_seconds=0.3,
+        control_read_timeout_seconds=0.05,
+        control_write_timeout_seconds=0.05,
+        control_settle_seconds=0.01,
+    )
+    app = create_app(settings, ha_transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=3,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "light",
+                        "service": "turn_on",
+                        "service_data": {"entity_id": "light.living_room"},
+                    },
+                },
+            ),
+        )
+    result = response.json()["result"]
+    assert result["isError"] is False
+    assert result["structuredContent"]["confirmed"] is True
+    assert result["structuredContent"]["write_outcome"] == "transport_ambiguous"
+    assert service_calls == 1
+
+
+def test_unconfirmed_write_returns_explicit_uncertainty(make_settings, fake_ha) -> None:
+    fake_ha.states[0]["state"] = "off"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/":
+            return httpx.Response(200, json={"message": "API running."})
+        if request.url.path == "/api/states/light.living_room":
+            return httpx.Response(200, json=fake_ha.states[0])
+        if request.url.path == "/api/services/light/turn_on":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"message": "not found"})
+
+    settings = make_settings(
+        enable_write_tools=True,
+        allowed_ha_services=frozenset({"light.turn_on"}),
+        allowed_ha_entities=LIGHT_ENTITIES,
+        control_total_timeout_seconds=0.12,
+        control_read_timeout_seconds=0.02,
+        control_write_timeout_seconds=0.05,
+        control_settle_seconds=0.01,
+    )
+    app = create_app(settings, ha_transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=3,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "light",
+                        "service": "turn_on",
+                        "service_data": {"entity_id": "light.living_room"},
+                    },
+                },
+            ),
+        )
+    result = response.json()["result"]
+    assert result["isError"] is True
+    assert result["structuredContent"]["code"] == "action_unconfirmed"
+    assert "Do not report success or failure" in result["structuredContent"]["error"]
+
+
+def test_control_logs_correlate_without_arguments_or_secrets(
+    make_settings, fake_ha, caplog
+) -> None:
+    fake_ha.states[0]["state"] = "off"
+    app = create_app(
+        make_settings(
+            enable_write_tools=True,
+            allowed_ha_services=frozenset({"light.turn_on"}),
+            allowed_ha_entities=LIGHT_ENTITIES,
+        ),
+        ha_transport=httpx.MockTransport(fake_ha),
+    )
+    caplog.set_level(logging.INFO)
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=3,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "light",
+                        "service": "turn_on",
+                        "service_data": {
+                            "entity_id": "light.living_room",
+                            "brightness_pct": 37,
+                        },
+                    },
+                },
+            ),
+        )
+    events = []
+    for record in caplog.records:
+        with contextlib.suppress(json.JSONDecodeError):
+            events.append(json.loads(record.getMessage()))
+    by_name = {event.get("event"): event for event in events if event.get("event")}
+    request_id = response.headers["x-request-id"]
+    assert by_name["request_completed"]["request_id"] == request_id
+    assert by_name["tool_completed"]["request_id"] == request_id
+    assert by_name["control_completed"]["request_id"] == request_id
+    assert by_name["tool_completed"]["is_error"] is False
+    assert by_name["control_completed"]["confirmed"] is True
+    assert by_name["control_completed"]["write_outcome"] == "accepted"
+    combined = "\n".join(record.getMessage() for record in caplog.records)
+    assert "brightness_pct" not in combined
+    assert "bridge-secret" not in combined
+    assert "ha-secret" not in combined
+
+
+def test_unavailable_entity_is_rejected_before_write(make_settings, fake_ha) -> None:
+    fake_ha.states[0]["state"] = "unavailable"
+    app = create_app(
+        make_settings(
+            enable_write_tools=True,
+            allowed_ha_services=frozenset({"light.turn_on"}),
+            allowed_ha_entities=LIGHT_ENTITIES,
+        ),
+        ha_transport=httpx.MockTransport(fake_ha),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            headers=auth_headers(),
+            json=rpc(
+                "tools/call",
+                msg_id=3,
+                params={
+                    "name": "call_ha_service",
+                    "arguments": {
+                        "domain": "light",
+                        "service": "turn_on",
+                        "service_data": {"entity_id": "light.living_room"},
+                    },
+                },
+            ),
+        )
+    result = response.json()["result"]
+    assert result["isError"] is True
+    assert result["structuredContent"]["code"] == "ha_entity_unavailable"
+    assert fake_ha.service_calls == 0
 
 
 def test_unlisted_service_is_blocked(make_settings, fake_ha) -> None:

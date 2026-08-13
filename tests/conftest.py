@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,7 @@ class FakeHomeAssistant:
             {
                 "entity_id": "light.living_room",
                 "state": "on",
-                "attributes": {"friendly_name": "Living room"},
+                "attributes": {"friendly_name": "Living room", "brightness": 255},
             },
             {
                 "entity_id": "sensor.temperature",
@@ -54,6 +55,14 @@ class FakeHomeAssistant:
             return httpx.Response(404, json={"message": "not found"})
         if request.url.path == "/api/services/light/turn_on":
             self.service_calls += 1
+            payload = json.loads(request.content)
+            for state in self.states:
+                if state["entity_id"] == payload["entity_id"]:
+                    state["state"] = "on"
+                    if "brightness_pct" in payload:
+                        state["attributes"]["brightness"] = round(
+                            payload["brightness_pct"] * 255 / 100
+                        )
             return httpx.Response(200, json=[{"context": {"id": "redacted"}}])
         return httpx.Response(404, json={"message": "not found"})
 

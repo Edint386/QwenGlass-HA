@@ -14,8 +14,12 @@
   allowlist；允许某个服务并不代表它可以操作其他实体。
 - HA `GET` 在传输错误时最多安全重试一次；可能操作设备的 `POST` 永不自动重试，
   避免一次指令执行两遍。
+- 设备控制有独立的 `1.8s` 总截止时间：先读取状态，已满足则直接确认；否则仅写入
+  一次，并在剩余预算内回读确认。只有目标状态得到确认才返回成功；结果不明确时返回
+  `action_unconfirmed`，不会把它误报成确定失败，也不会自动重试写操作。
 - 请求体、HA 响应、服务参数、并发量和旧协议 session 都有上限。
-- 不记录请求头、请求体、参数值或令牌；日志仅包含请求 ID、路径、状态、耗时和工具名。
+- 不记录请求头、请求体、密钥或服务参数值；JSON 日志仅包含请求 ID、路径、工具名、
+  允许列表内的目标实体、HA 状态/HTTP 结果、最终 `isError` 和耗时。
 
 ## MCP 工具
 
@@ -28,6 +32,10 @@
 只有 `ENABLE_WRITE_TOOLS=true`，且服务和目标实体分别位于
 `ALLOWED_HA_SERVICES` / `ALLOWED_HA_ENTITIES` 时，才会额外暴露
 `call_ha_service`。该工具支持 `dry_run=true`，实际调用不会自动重试。
+控制成功结果包含 `confirmed=true`；`already_satisfied=true` 表示操作前已经达到目标状态。
+若返回 `action_unconfirmed`，客户端应说“结果未确认”，不能说“操作失败”，也不能自动
+重复写入。实体为 `unavailable` / `unknown` 时会在写入前以
+`ha_entity_unavailable` 结束。
 
 快捷设备别名通过 `HA_DEVICE_ALIASES_JSON` 配置，并随现有
 `call_ha_service` 的工具说明和 `entity_id` 枚举一起返回给 MCP 客户端，不需要新增接口。

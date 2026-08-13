@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -11,13 +12,18 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Settings
-from .errors import BridgeError, ToolInputError, ToolPermissionError
+from .errors import BridgeError, HomeAssistantError, ToolInputError, ToolPermissionError
 from .ha_client import HomeAssistantClient
+from .middleware import current_request_id
 
 logger = logging.getLogger(__name__)
 
 _HA_NAME = re.compile(r"^[a-z0-9_]+$")
 _ENTITY_ID = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+_ACTION_UNCONFIRMED_MESSAGE = (
+    "Home Assistant may have received the action, but the resulting state was not confirmed. "
+    "Do not report success or failure and do not retry the write automatically."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +244,8 @@ class ToolRegistry:
         if not isinstance(arguments, dict):
             raise ToolInputError("tool arguments must be an object", code="invalid_arguments")
         started = time.perf_counter()
+        outcome = "success"
+        error_code: str | None = None
         try:
             if name == "bridge_status":
                 self._only_keys(arguments, set())
@@ -249,11 +257,29 @@ class ToolRegistry:
             if name == "call_ha_service":
                 return await self._call_service(arguments)
             raise ToolInputError(f"unknown tool: {name}", code="unknown_tool")
+        except BridgeError as exc:
+            outcome = "error"
+            error_code = exc.code
+            raise
+        except Exception:
+            outcome = "error"
+            error_code = "internal_error"
+            raise
         finally:
             logger.info(
-                "tool completed name=%r duration_ms=%.1f",
-                name,
-                (time.perf_counter() - started) * 1000,
+                "%s",
+                json.dumps(
+                    {
+                        "event": "tool_completed",
+                        "request_id": current_request_id(),
+                        "tool": name,
+                        "is_error": outcome == "error",
+                        "error_code": error_code,
+                        "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
             )
 
     @staticmethod
@@ -400,6 +426,244 @@ class ToolRegistry:
                     )
         return entity_id
 
+    @staticmethod
+    def _state_is_unavailable(state: dict[str, Any]) -> bool:
+        return state.get("state") in {"unavailable", "unknown", None}
+
+    @staticmethod
+    def _state_matches_target(
+        domain: str, service: str, state: dict[str, Any], payload: dict[str, Any]
+    ) -> bool:
+        current = state.get("state")
+        if current in {"unavailable", "unknown", None}:
+            return False
+        if domain == "light" and service == "turn_on":
+            if current != "on":
+                return False
+            if "brightness_pct" not in payload:
+                return True
+            attributes = state.get("attributes")
+            brightness = attributes.get("brightness") if isinstance(attributes, dict) else None
+            expected = round(payload["brightness_pct"] * 255 / 100)
+            return (
+                isinstance(brightness, int)
+                and not isinstance(brightness, bool)
+                and abs(brightness - expected) <= 1
+            )
+        if domain == "light" and service == "turn_off":
+            return current == "off"
+        if domain == "climate" and service == "turn_on":
+            return current not in {"off", "unavailable", "unknown", None}
+        if domain == "climate" and service == "turn_off":
+            return current == "off"
+        if domain == "climate" and service == "set_temperature":
+            attributes = state.get("attributes")
+            current_temperature = (
+                attributes.get("temperature") if isinstance(attributes, dict) else None
+            )
+            target_temperature = payload.get("temperature")
+            return (
+                isinstance(current_temperature, (int, float))
+                and not isinstance(current_temperature, bool)
+                and isinstance(target_temperature, (int, float))
+                and not isinstance(target_temperature, bool)
+                and math.isclose(current_temperature, target_temperature, abs_tol=0.1)
+            )
+        return False
+
+    async def _read_control_state(
+        self, entity_id: str, *, timeout_seconds: float
+    ) -> dict[str, Any]:
+        return await asyncio.wait_for(
+            self.ha.state(
+                entity_id,
+                timeout_seconds=timeout_seconds,
+                retry_transport=False,
+            ),
+            timeout=timeout_seconds,
+        )
+
+    async def _confirm_control_state(
+        self,
+        *,
+        domain: str,
+        service: str,
+        entity_id: str,
+        payload: dict[str, Any],
+        deadline: float,
+    ) -> dict[str, Any]:
+        last_state: dict[str, Any] | None = None
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                last_state = await self._read_control_state(
+                    entity_id,
+                    timeout_seconds=min(self.settings.control_read_timeout_seconds, remaining),
+                )
+                if self._state_matches_target(domain, service, last_state, payload):
+                    return last_state
+            except TimeoutError:
+                pass
+            except HomeAssistantError as exc:
+                if exc.code != "ha_unreachable":
+                    raise
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(self.settings.control_settle_seconds, remaining))
+        readback = last_state.get("state") if last_state else None
+        raise HomeAssistantError(
+            _ACTION_UNCONFIRMED_MESSAGE
+            + (f" (last state: {readback})" if readback is not None else ""),
+            code="action_unconfirmed",
+        )
+
+    async def _execute_control(
+        self,
+        *,
+        domain: str,
+        service: str,
+        entity_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        request_id = current_request_id()
+        full_service = f"{domain}.{service}"
+        deadline = asyncio.get_running_loop().time() + self.settings.control_total_timeout_seconds
+        precheck_state: dict[str, Any] | None = None
+        precheck_error: str | None = None
+        action = "precheck"
+        readback_state: Any = None
+        http_status: Any = None
+        write_outcome: str | None = None
+        confirmed = False
+        error_code = "-"
+
+        try:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise HomeAssistantError(
+                    _ACTION_UNCONFIRMED_MESSAGE, code="action_unconfirmed"
+                )
+            try:
+                precheck_state = await self._read_control_state(
+                    entity_id,
+                    timeout_seconds=min(self.settings.control_read_timeout_seconds, remaining),
+                )
+            except TimeoutError:
+                precheck_error = "timeout"
+            except HomeAssistantError as exc:
+                if exc.code != "ha_unreachable":
+                    raise
+                precheck_error = exc.code
+
+            if precheck_state is not None:
+                if self._state_is_unavailable(precheck_state):
+                    raise HomeAssistantError(
+                        "Home Assistant target is currently unavailable",
+                        code="ha_entity_unavailable",
+                    )
+                if self._state_matches_target(domain, service, precheck_state, payload):
+                    action = "already_satisfied"
+                    readback_state = precheck_state.get("state")
+                    write_outcome = "skipped"
+                    confirmed = True
+                    return {
+                        "service": full_service,
+                        "entity_id": entity_id,
+                        "confirmed": True,
+                        "already_satisfied": True,
+                        "write_attempted": False,
+                        "write_outcome": write_outcome,
+                        "http_status": None,
+                        "readback_state": readback_state,
+                    }
+
+            action = "write"
+            remaining = deadline - asyncio.get_running_loop().time()
+            write_budget = min(self.settings.control_write_timeout_seconds, remaining)
+            if write_budget <= 0:
+                raise HomeAssistantError(
+                    _ACTION_UNCONFIRMED_MESSAGE, code="action_unconfirmed"
+                )
+            action_result: dict[str, Any] = {}
+            write_error_code: str | None = None
+            try:
+                action_result = await asyncio.wait_for(
+                    self.ha.call_service(
+                        domain, service, payload, timeout_seconds=write_budget
+                    ),
+                    timeout=write_budget,
+                )
+            except TimeoutError:
+                write_error_code = "timeout"
+            except HomeAssistantError as exc:
+                if exc.code == "ha_unreachable":
+                    write_error_code = exc.code
+                else:
+                    raise
+            http_status = action_result.get("http_status")
+            write_outcome = "transport_ambiguous" if write_error_code else "accepted"
+
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining > 0 and self.settings.control_settle_seconds > 0:
+                await asyncio.sleep(min(self.settings.control_settle_seconds, remaining))
+            readback = await self._confirm_control_state(
+                domain=domain,
+                service=service,
+                entity_id=entity_id,
+                payload=payload,
+                deadline=deadline,
+            )
+            readback_state = readback.get("state")
+
+            result = dict(action_result)
+            result.update(
+                {
+                    "service": full_service,
+                    "entity_id": entity_id,
+                    "confirmed": True,
+                    "already_satisfied": False,
+                    "write_attempted": True,
+                    "write_outcome": write_outcome,
+                    "http_status": http_status,
+                    "readback_state": readback_state,
+                }
+            )
+            confirmed = True
+            return result
+        except HomeAssistantError as exc:
+            error_code = exc.code
+            raise
+        finally:
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "control_completed",
+                        "request_id": request_id,
+                        "domain": domain,
+                        "service": service,
+                        "entity_id": entity_id,
+                        "action": action,
+                        "confirmed": confirmed,
+                        "precheck_state": precheck_state.get("state")
+                        if precheck_state
+                        else None,
+                        "precheck_error": precheck_error,
+                        "readback_state": readback_state,
+                        "ha_http_status": http_status,
+                        "write_outcome": write_outcome,
+                        "error_code": None if error_code == "-" else error_code,
+                        "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+
     async def _call_service(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if not self.settings.enable_write_tools:
             raise ToolPermissionError("write tools are disabled", code="writes_disabled")
@@ -448,7 +712,12 @@ class ToolRegistry:
                 "entity_id": entity_id,
                 "service_data_keys": sorted(payload),
             }
-        return await self.ha.call_service(domain, service, payload)
+        return await self._execute_control(
+            domain=domain,
+            service=service,
+            entity_id=entity_id,
+            payload=payload,
+        )
 
 
 def tool_result(payload: dict[str, Any]) -> dict[str, Any]:

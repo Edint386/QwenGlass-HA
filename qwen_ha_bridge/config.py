@@ -149,6 +149,10 @@ class Settings:
     max_state_results: int = 1_000
     max_concurrent_ha_requests: int = 8
     ha_timeout_seconds: float = 3.0
+    control_total_timeout_seconds: float = 1.8
+    control_read_timeout_seconds: float = 0.25
+    control_write_timeout_seconds: float = 1.0
+    control_settle_seconds: float = 0.05
     keepalive_interval_seconds: float = 10.0
     session_ttl_seconds: int = 900
     max_sessions: int = 1_024
@@ -196,6 +200,31 @@ class Settings:
         if self.climate_temperature_min >= self.climate_temperature_max:
             raise ConfigurationError(
                 "CLIMATE_TEMPERATURE_MIN must be below CLIMATE_TEMPERATURE_MAX",
+                code="invalid_config",
+            )
+        if (
+            self.control_total_timeout_seconds <= 0
+            or self.control_read_timeout_seconds <= 0
+            or self.control_write_timeout_seconds <= 0
+            or self.control_settle_seconds < 0
+        ):
+            raise ConfigurationError(
+                "HA control timeouts must be positive (settle may be zero)",
+                code="invalid_config",
+            )
+        if self.control_total_timeout_seconds > 2.0:
+            raise ConfigurationError(
+                "HA_CONTROL_TOTAL_TIMEOUT_SECONDS must be at most 2.0",
+                code="invalid_config",
+            )
+        control_phase_budget = (
+            (self.control_read_timeout_seconds * 2)
+            + self.control_write_timeout_seconds
+            + self.control_settle_seconds
+        )
+        if control_phase_budget > self.control_total_timeout_seconds:
+            raise ConfigurationError(
+                "HA control phase timeouts must fit within HA_CONTROL_TOTAL_TIMEOUT_SECONDS",
                 code="invalid_config",
             )
         if not self.allowed_hosts:
@@ -246,6 +275,18 @@ class Settings:
                 "MAX_CONCURRENT_HA_REQUESTS", 8, minimum=1, maximum=100
             ),
             ha_timeout_seconds=_float("HA_TIMEOUT_SECONDS", 3.0, minimum=0.1, maximum=60.0),
+            control_total_timeout_seconds=_float(
+                "HA_CONTROL_TOTAL_TIMEOUT_SECONDS", 1.8, minimum=0.2, maximum=2.0
+            ),
+            control_read_timeout_seconds=_float(
+                "HA_CONTROL_READ_TIMEOUT_SECONDS", 0.25, minimum=0.05, maximum=5.0
+            ),
+            control_write_timeout_seconds=_float(
+                "HA_CONTROL_WRITE_TIMEOUT_SECONDS", 1.0, minimum=0.05, maximum=5.0
+            ),
+            control_settle_seconds=_float(
+                "HA_CONTROL_SETTLE_SECONDS", 0.05, minimum=0.0, maximum=1.0
+            ),
             keepalive_interval_seconds=_float(
                 "HA_KEEPALIVE_INTERVAL_SECONDS", 10.0, minimum=0.0, maximum=300.0
             ),

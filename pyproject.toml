@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "qwen-glass-ha"
-version = "0.1.0"
+version = "0.2.0"
 description = "A defensive MCP bridge between Qwen/Quark glasses and Home Assistant"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,0 +1,58 @@
+openapi: 3.0.3
+info:
+  title: Qwen-HA Timeout Probe (read-only)
+  version: "1.0.0"
+  description: >-
+    Isolated, read-only timeout probe. It does not connect to Home Assistant,
+    read secrets, or control devices. It waits for a fixed requested delay and
+    returns server timing so a client can expose its own timeout behavior.
+servers:
+  - url: https://ha.qwen.xsnight.cn
+paths:
+  /probe:
+    get:
+      operationId: probeDelay
+      summary: Wait for a fixed delay and echo server timing
+      parameters:
+        - name: delay_ms
+          in: query
+          required: false
+          description: Server-side delay before responding, in milliseconds.
+          schema:
+            type: integer
+            enum: [0, 500, 1000, 1500, 2000, 2500, 3000]
+            default: 0
+      responses:
+        "200":
+          description: The requested delay completed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requested_delay_ms, server_elapsed_ms, request_id]
+                properties:
+                  requested_delay_ms:
+                    type: integer
+                  server_elapsed_ms:
+                    type: integer
+                  request_id:
+                    type: string
+                    format: uuid
+        "400":
+          description: delay_ms is not an integer or is outside the allowed enum.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, allowed, request_id]
+                properties:
+                  error:
+                    type: string
+                  allowed:
+                    type: array
+                    items:
+                      type: integer
+                  request_id:
+                    type: string
+                    format: uuid
+      security: []
