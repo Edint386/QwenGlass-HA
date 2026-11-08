@@ -1,0 +1,14 @@
+.state/
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+.ruff_cache/
+.DS_Store
+dist/
+build/
+*.egg-info/
+# what deploy/ creates on your server
+deploy/devices.toml
+deploy/data/
+deploy/ha-config/

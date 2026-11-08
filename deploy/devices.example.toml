@@ -1,0 +1,42 @@
+# 设备的说法：嘴里的名字 → HA 实体。复制成 deploy/devices.toml，换成你家的设备。
+#
+# - 实体 ID 在 HA 的「设置 → 设备与服务 → 实体」里看，或者在服务器上运行
+#   docker exec glasshome-voice python -m glasshome.cli devices
+# - names 第一个是回话时用的名字。米家的名字常常很长（“米家智能台灯 Pro”），常用设备在这里起短名。
+# - 没写在这里的设备，用 HA 里的名字（去掉空格）也能叫，重名的不算。
+# - 认设备每次现读这个文件；但设备名单还写在 control 工具的描述里，让平台的大模型知道有哪些设备，
+#   所以改完要 docker compose restart voice，再在平台的 MCP 插件里点「刷新 MCP 工具」。
+
+[[device]]
+entity = "climate.xiaomi_cn_123456789_mc5"
+names = ["空调", "客厅空调"]
+
+[[device]]
+entity = "light.yeelink_cn_123456789_lamp15_s_2"
+names = ["显示器挂灯", "挂灯"]
+
+[[device]]
+entity = "light.yeelink_cn_123456789_mono5_s_2_light"
+names = ["灯泡"]
+
+[[device]]
+entity = "fan.zhimi_cn_123456789_oa1_s_2_air_purifier"
+names = ["空气净化器", "净化器"]
+
+[[device]]
+entity = "media_player.xiaomi_cn_123456789_l05c"
+names = ["音箱", "小爱音箱"]
+
+# 扫地机：开 = 开始扫，关 = 回去充电
+[[device]]
+entity = "vacuum.xiaomi_cn_123456789_c102cn"
+names = ["扫地机", "扫地机器人"]
+
+# 温湿度计：只能问，“屋里多少度”“湿度多少”
+[[device]]
+entity = "sensor.miaomiaoc_cn_blt_3_xxxxxxxxxxxx_t2_temperature_p_2_1"
+names = ["屋里", "室温"]
+
+[[device]]
+entity = "sensor.miaomiaoc_cn_blt_3_xxxxxxxxxxxx_t2_relative_humidity_p_2_2"
+names = ["湿度", "屋里湿度"]

@@ -1,0 +1,67 @@
+# 两个容器：Home Assistant（glasshome-ha）和本服务（glasshome-voice）。在 deploy/ 里运行 docker compose up -d --build，
+# 本服务的配置读仓库根目录的 .env。两个都只监听回环，公网入口是你的反向代理（site.conf）；本服务经内部网络连 HA。
+# 已经有 HA 的话：删掉 homeassistant 这一段和 voice 的 depends_on，把 .env 里的 GLASSHOME_HA_URL 指向你的 HA。
+name: glasshome
+
+services:
+  homeassistant:
+    # 国内服务器拉镜像用 Docker Hub 的镜像加速（/etc/docker/daemon.json），ghcr.io 在国内不稳
+    image: homeassistant/home-assistant:stable
+    container_name: glasshome-ha
+    volumes:
+      - ./ha-config:/config
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      TZ: Asia/Shanghai
+      # 集成的依赖装在国内镜像上，不然 pypi.org 很慢。服务器在国外就删掉这两行
+      UV_INDEX_URL: https://mirrors.cloud.tencent.com/pypi/simple
+      PIP_INDEX_URL: https://mirrors.cloud.tencent.com/pypi/simple
+    ports:
+      - 127.0.0.1:8123:8123
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  voice:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: glasshome-voice:local
+    container_name: glasshome-voice
+    env_file:
+      - ../.env
+    environment:
+      GLASSHOME_DEVICES: /app/devices.toml
+      GLASSHOME_DATA: /data
+    volumes:
+      - ./devices.toml:/app/devices.toml:ro
+      # 服务的数据目录，属主要是 10001（sudo install -d -o 10001 -g 10001 data）
+      - ./data:/data
+    ports:
+      - 127.0.0.1:19530:19530
+      - 127.0.0.1:19531:19531
+    depends_on:
+      - homeassistant
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    mem_limit: 256m
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; [u.urlopen(f'http://127.0.0.1:{p}/healthz', timeout=2) for p in (19530, 19531)]"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
